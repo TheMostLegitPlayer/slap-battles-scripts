@@ -18,7 +18,6 @@ Windows, `xdotool` on Linux. Screen capture uses mss.
 """
 import os
 import time
-import shutil
 import platform
 import subprocess
 from collections import namedtuple
@@ -43,7 +42,8 @@ AFTER_RESET = 4.5                  # seconds to wait after a reset
 # ---- input --------------------------------------------------------------
 # Mouse goes through pynput on both OSes (works in Sober). Keyboard differs:
 # on Windows pynput is fine, but on Linux/Sober synthetic XTEST keys are ignored
-# by Roblox, so we inject real key events via ydotool (uinput, kernel level).
+# by Roblox, so we inject real key events through a uinput device (evdev), with a
+# ydotool subprocess as fallback.
 _mouse = _ms.Controller()
 
 if IS_WIN:
@@ -70,21 +70,48 @@ if IS_WIN:
                 pass
 
 else:
-    # Linux input-event keycodes (linux/input-event-codes.h)
-    _YKEY = {"W": 17, "A": 30, "S": 31, "D": 32, "R": 19, "E": 18,
-             "ESC": 1, "ENTER": 28}
+    # Linux keyboard: keep ONE persistent uinput device (python-evdev) for the
+    # whole session. Emitting a key is then ~0.05ms with no subprocess. This
+    # avoids ydotool 0.1.8's trap: it creates+destroys a uinput device per call,
+    # and that constant input-device hotplug makes the whole desktop stutter.
+    _ui = None
+    try:
+        from evdev import UInput, ecodes as _e
+        _EV = {"W": _e.KEY_W, "A": _e.KEY_A, "S": _e.KEY_S, "D": _e.KEY_D,
+               "R": _e.KEY_R, "E": _e.KEY_E, "ESC": _e.KEY_ESC,
+               "ENTER": _e.KEY_ENTER}
+        _ui = UInput({_e.EV_KEY: list(_EV.values())}, name="farmbot-kbd")
+        time.sleep(0.3)                         # let the compositor register it once
 
-    def tap(n, d):
-        # one ydotool call = one uinput device lifetime: press, hold, release.
-        # (0.1.8 has no daemon, so a key can't be held across two processes.)
-        # keep ydotool's default start --delay (~100ms): it lets the freshly
-        # created uinput device settle, otherwise the key event gets dropped.
-        hold = max(1, int(d * 1000))
-        subprocess.run(["ydotool", "key", "--key-delay", str(hold),
-                        f"{_YKEY[n]}:1", f"{_YKEY[n]}:0"], capture_output=True)
+        def kdown(n):
+            _ui.write(_e.EV_KEY, _EV[n], 1); _ui.syn()
 
-    def release_all():
-        pass                        # ydotool taps never leave a key held
+        def kup(n):
+            _ui.write(_e.EV_KEY, _EV[n], 0); _ui.syn()
+
+        def tap(n, d):
+            kdown(n); time.sleep(d); kup(n)     # real hold, persistent device
+
+        def release_all():
+            for k in ("W", "A", "S", "D"):
+                try:
+                    kup(k)
+                except Exception:
+                    pass
+    except Exception as _ex:
+        # Fallback: ydotool subprocess (works, but stutters — see above).
+        print(f"[!] evdev uinput unavailable ({_ex}); using ydotool fallback.\n"
+              "    Better: pip install evdev  (and /dev/uinput writable)", flush=True)
+        _YKEY = {"W": 17, "A": 30, "S": 31, "D": 32, "R": 19, "E": 18,
+                 "ESC": 1, "ENTER": 28}
+
+        def tap(n, d):
+            hold = max(1, int(d * 1000))
+            subprocess.run(["ydotool", "key", "--key-delay", str(hold),
+                            f"{_YKEY[n]}:1", f"{_YKEY[n]}:0"], capture_output=True)
+
+        def release_all():
+            pass
 
 
 def click(x, y):
@@ -339,14 +366,12 @@ def _quit():
 def main():
     global _rect, _hwnd
     if not IS_WIN:
-        print("[i] Linux: mouse/hotkeys via pynput (X11), keys via ydotool (uinput).")
-        if not shutil.which("ydotool"):
-            print("[!] ydotool not found — movement keys won't reach the game.\n"
-                  "    Install:  sudo apt install ydotool")
-        elif not os.access("/dev/uinput", os.W_OK):
-            print("[!] /dev/uinput not writable — ydotool keys will fail.\n"
+        via = "uinput/evdev" if _ui is not None else "ydotool"
+        print(f"[i] Linux: mouse/hotkeys via pynput (X11), keys via {via}.")
+        if not os.access("/dev/uinput", os.W_OK):
+            print("[!] /dev/uinput not writable — keyboard won't reach the game.\n"
                   "    Fix:  sudo chgrp input /dev/uinput && sudo chmod 660 /dev/uinput\n"
-                  "    (you're in group 'input'); a reboot-safe udev rule may be needed.")
+                  "    (you're in group 'input'); the 99-uinput.rules udev rule keeps it.")
     found = find_window()
     if not found or not found[0]:
         print("[!] Roblox window not found. Launch the game and try again.")
