@@ -145,6 +145,13 @@ if IS_WIN:
         named.sort(key=lambda o: o[2], reverse=True)
         return named[0][0], named[0][1]
 
+    def refresh_rect(h):                     # cheap: is the cached window still alive?
+        if not _u.IsWindow(h):
+            return None
+        r = wintypes.RECT()
+        _u.GetWindowRect(h, ctypes.byref(r))
+        return Rect(r.left, r.top, r.right, r.bottom)
+
     def focus(h):
         _u.ShowWindow(h, 9)
         fg = _u.GetForegroundWindow()
@@ -169,47 +176,60 @@ else:   # ---- Linux (X11) via xdotool ----
                 ["search", "--name", "Sober"],
                 ["search", "--classname", "sober"])
 
+    def _geom(wid):
+        g = _xdo("getwindowgeometry", "--shell", wid)
+        if g.returncode != 0:
+            return None
+        d = {}
+        for line in g.stdout.splitlines():
+            if "=" in line:
+                kk, _, vv = line.partition("=")
+                d[kk] = vv
+        try:
+            x, y = int(d["X"]), int(d["Y"])
+            w, h = int(d["WIDTH"]), int(d["HEIGHT"])
+        except Exception:
+            return None
+        return Rect(x, y, x + w, y + h)
+
     def find_window():
         ids = []
         for q in _QUERIES:
             r = _xdo(*q)
             if r.returncode == 0:
                 ids += [i for i in r.stdout.split() if i]
-        best, barea = (None, None), 0
+        best, barea = None, 0
         for wid in dict.fromkeys(ids):                 # dedupe, keep order
-            g = _xdo("getwindowgeometry", "--shell", wid)
-            if g.returncode != 0:
-                continue
-            d = {}
-            for line in g.stdout.splitlines():
-                if "=" in line:
-                    kk, _, vv = line.partition("=")
-                    d[kk] = vv
-            try:
-                x, y = int(d["X"]), int(d["Y"])
-                w, h = int(d["WIDTH"]), int(d["HEIGHT"])
-            except Exception:
-                continue
-            if w > 300 and h > 300 and w * h > barea:
-                barea, best = w * h, (wid, Rect(x, y, x + w, y + h))
+            g = _geom(wid)
+            if g and (g.right-g.left) > 300 and (g.bottom-g.top) > 300:
+                area = (g.right-g.left) * (g.bottom-g.top)
+                if area > barea:
+                    barea, best = area, (wid, g)
         return best
 
+    def refresh_rect(wid):                   # cheap per-cycle geometry, no search
+        return _geom(wid)
+
     def focus(wid):
-        _xdo("windowactivate", "--sync", wid)
-        time.sleep(0.3)
+        _xdo("windowactivate", wid)          # no --sync: it can block for seconds
+        time.sleep(0.15)
 
 
 # ---- screen capture + portal detection (pure numpy) ------------------------
-def grab(sct, rect):
-    mon = {"left": rect.left, "top": rect.top,
-           "width": rect.right - rect.left, "height": rect.bottom - rect.top}
+def grab_roi(sct, rect):
+    """Grab ONLY the detection band (ROI_TOP..ROI_BOT of the window height), not
+    the whole window — a ~5x smaller capture, so scanning doesn't lag the game."""
+    H = rect.bottom - rect.top
+    top = rect.top + int(H * ROI_TOP)
+    height = max(1, int(H * (ROI_BOT - ROI_TOP)))
+    mon = {"left": rect.left, "top": top,
+           "width": rect.right - rect.left, "height": height}
     return np.array(sct.grab(mon))[:, :, :3]           # BGRA -> BGR
 
 
-def detect_portal(bgr):
-    h, w = bgr.shape[:2]
-    y0, y1 = int(h * ROI_TOP), int(h * ROI_BOT)
-    roi = bgr[y0:y1, :]
+def detect_portal(roi):
+    """roi is already the detection band (see grab_roi)."""
+    h, w = roi.shape[:2]
     b, g, r = roi[:, :, 0], roi[:, :, 1], roi[:, :, 2]
     mask = (b < DARK_V) & (g < DARK_V) & (r < DARK_V)
     mask[:, :int(w * 0.12)] = False
@@ -241,16 +261,23 @@ def do_reset():
 
 
 def walk_once(sct, rect):
-    d, cx = detect_portal(grab(sct, rect))
+    d, cx = detect_portal(grab_roi(sct, rect))
     cxs = f"{cx:.0f}" if cx is not None else "-"
     print(f"  found: {d} (cx={cxs}), walking 0.5s", flush=True)
-    release_all(); tap(d, 0.5); release_all()
+    tap(d, 0.5)
 
 
 def ensure_front():
-    """Find the live Roblox window and bring it forward. False if the game is
-    gone (then we DON'T act, so the bot never 'farms the desktop')."""
+    """Keep the cached Roblox window; only do a full (expensive) search when we
+    don't have one. Returns False if the game is gone (then we DON'T act, so the
+    bot never 'farms the desktop')."""
     global _hwnd, _rect, run_farm, run_walk
+    if _hwnd is not None:                     # cheap path: refresh geometry only
+        r = refresh_rect(_hwnd)
+        if r is not None:
+            _rect = r
+            return True
+        _hwnd = None                          # cached window died -> re-search
     found = find_window()
     if not found or not found[0]:
         print("[!] Roblox window not found — stopping (game closed?)", flush=True)
@@ -258,7 +285,7 @@ def ensure_front():
         run_farm = run_walk = False
         return False
     _hwnd, _rect = found
-    focus(_hwnd)
+    focus(_hwnd)                              # focus only when (re)acquiring
     return True
 
 
