@@ -16,10 +16,10 @@ Windows, `xdotool` on Linux. Screen capture uses mss.
 
 ⚠ Automation is against Roblox rules — use a throwaway account, at your own risk.
 """
-import sys
+import os
 import time
+import shutil
 import platform
-import threading
 import subprocess
 from collections import namedtuple
 
@@ -27,6 +27,7 @@ import numpy as np
 import mss
 from pynput import keyboard as _kb, mouse as _ms
 
+_MSS = getattr(mss, "MSS", None) or mss.mss     # new API, fall back to old alias
 IS_WIN = platform.system() == "Windows"
 Rect = namedtuple("Rect", "left top right bottom")
 
@@ -39,33 +40,51 @@ DEAD_FRAC = 0.07                   # centre dead-zone -> walk backwards (S)
 GO_BTN = (0.50, 0.925)             # "Go To Portal" button, relative to window
 AFTER_RESET = 4.5                  # seconds to wait after a reset
 
-# ---- input via pynput (Windows + Linux/X11) --------------------------------
-_kbd = _kb.Controller()
+# ---- input --------------------------------------------------------------
+# Mouse goes through pynput on both OSes (works in Sober). Keyboard differs:
+# on Windows pynput is fine, but on Linux/Sober synthetic XTEST keys are ignored
+# by Roblox, so we inject real key events via ydotool (uinput, kernel level).
 _mouse = _ms.Controller()
-KEYMAP = {"W": "w", "A": "a", "S": "s", "D": "d", "R": "r", "E": "e",
-          "ESC": _kb.Key.esc, "ENTER": _kb.Key.enter}
 
+if IS_WIN:
+    _kbd = _kb.Controller()
+    _KEYMAP = {"W": "w", "A": "a", "S": "s", "D": "d", "R": "r", "E": "e",
+               "ESC": _kb.Key.esc, "ENTER": _kb.Key.enter}
 
-def kdown(n):
-    _kbd.press(KEYMAP[n])
+    def kdown(n):
+        _kbd.press(_KEYMAP[n])
 
+    def kup(n):
+        _kbd.release(_KEYMAP[n])
 
-def kup(n):
-    _kbd.release(KEYMAP[n])
+    def tap(n, d):
+        kdown(n)
+        time.sleep(d)
+        kup(n)
 
+    def release_all():
+        for k in ("W", "A", "S", "D"):
+            try:
+                kup(k)
+            except Exception:
+                pass
 
-def tap(n, d):
-    kdown(n)
-    time.sleep(d)
-    kup(n)
+else:
+    # Linux input-event keycodes (linux/input-event-codes.h)
+    _YKEY = {"W": 17, "A": 30, "S": 31, "D": 32, "R": 19, "E": 18,
+             "ESC": 1, "ENTER": 28}
 
+    def tap(n, d):
+        # one ydotool call = one uinput device lifetime: press, hold, release.
+        # (0.1.8 has no daemon, so a key can't be held across two processes.)
+        # keep ydotool's default start --delay (~100ms): it lets the freshly
+        # created uinput device settle, otherwise the key event gets dropped.
+        hold = max(1, int(d * 1000))
+        subprocess.run(["ydotool", "key", "--key-delay", str(hold),
+                        f"{_YKEY[n]}:1", f"{_YKEY[n]}:0"], capture_output=True)
 
-def release_all():
-    for k in ("W", "A", "S", "D"):
-        try:
-            kup(k)
-        except Exception:
-            pass
+    def release_all():
+        pass                        # ydotool taps never leave a key held
 
 
 def click(x, y):
@@ -293,7 +312,14 @@ def _quit():
 def main():
     global _rect, _hwnd
     if not IS_WIN:
-        print("[i] Linux: input/hotkeys via pynput on X11 (Sober). Needs xdotool.")
+        print("[i] Linux: mouse/hotkeys via pynput (X11), keys via ydotool (uinput).")
+        if not shutil.which("ydotool"):
+            print("[!] ydotool not found — movement keys won't reach the game.\n"
+                  "    Install:  sudo apt install ydotool")
+        elif not os.access("/dev/uinput", os.W_OK):
+            print("[!] /dev/uinput not writable — ydotool keys will fail.\n"
+                  "    Fix:  sudo chgrp input /dev/uinput && sudo chmod 660 /dev/uinput\n"
+                  "    (you're in group 'input'); a reboot-safe udev rule may be needed.")
     found = find_window()
     if not found or not found[0]:
         print("[!] Roblox window not found. Launch the game and try again.")
@@ -308,7 +334,7 @@ def main():
                             "<f10>": _quit})
     hk.start()
 
-    with mss.mss() as sct:
+    with _MSS() as sct:
         while alive:
             if run_farm:
                 farm_cycle(sct)

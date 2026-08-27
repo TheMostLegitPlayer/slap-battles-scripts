@@ -21,9 +21,16 @@ _(more coming: fishing helper, farm + auto-click opponents)_
 
 **Linux (X11 / Roblox via Sober):**
 ```bash
-bash farmbot/run.sh      # makes a .venv, installs deps, runs
+sudo apt install xdotool ydotool     # one-time
+bash farmbot/run.sh                   # makes a .venv, installs deps, runs
 ```
-Linux input goes through pynput (XTEST) — no root needed — and window detection uses
-`xdotool` (`sudo apt install xdotool`).
+On Linux: mouse + hotkeys go through pynput (XTEST, no root); **movement keys go through
+`ydotool`** (uinput) because Sober/Wine ignores synthetic XTEST key presses; window
+detection uses `xdotool`. `ydotool` needs write access to `/dev/uinput` — add yourself to
+the `input` group and make the device group-writable (a udev rule keeps it across reboots):
+```bash
+echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules
+sudo usermod -aG input "$USER"        # then re-login
+```
 
 See each folder for its own hotkeys and notes.
