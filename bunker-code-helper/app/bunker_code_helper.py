@@ -1,15 +1,6 @@
 """
-Bunker Code Helper - runtime
-=============================
-Press the screenshot hotkey (default: End). The tool grabs the screen, shows a
-top-of-screen overlay box ("Sent to Gemini..."), sends the shot to Gemini or
-OpenAI with a prompt asking for numbers only, and highlights the answer in the
-same overlay box the moment it arrives.
-
-Configure everything in the setup app (setup.bat) - provider, API key, hotkey,
-prompt. Launch this file via run.bat (which setup creates).
-
-Windows-first, but works anywhere Python + the deps are installed.
+Bunker Code Helper. Press the hotkey (End) -> screenshot -> Gemini/OpenAI ->
+answer shown in an overlay box. Set it up with setup.bat / linux/setup.sh.
 """
 import os
 import io
@@ -28,10 +19,7 @@ APP = os.path.dirname(os.path.abspath(__file__))
 CFG = os.path.join(APP, "config")
 IS_WIN = platform.system() == "Windows"
 
-# ---------------------------------------------------------------- dependencies
-# Hotkey backend differs per OS: `keyboard` on Windows (no admin needed), and
-# `pynput` on Linux/macOS (works on X11 as a normal user — no root, unlike the
-# `keyboard` lib which needs /dev/input access).
+# keyboard lib on Windows, pynput elsewhere (pynput needs no root on X11)
 try:
     import requests
     from PIL import Image
@@ -50,24 +38,22 @@ except ImportError as e:
         pass
     sys.exit(1)
 
-# ---------------------------------------------------------------- config
 DEFAULTS = {
-    "provider": "gemini",              # "gemini" | "openai" (openai = any OpenAI-compatible)
+    "provider": "gemini",              # gemini | openai (openai-compatible)
     "api_key": "",
-    "base_url": "",                    # for provider "openai": blank -> OpenAI; or NIM/Groq/Ollama…
-    "model": "",                       # blank -> per-provider default below
+    "base_url": "",                    # openai provider: blank = OpenAI, else NIM/Groq/Ollama
+    "model": "",
     "hotkey": "end",
     "quit_hotkey": "f8",
-    "region": "full",                  # "full" | "right" | "left" screen crop
-    "local_math": True,                # let the AI READ, but compute arithmetic in Python
-    "prompt": "",                      # EXTRA instructions, appended to the built-in prompt
+    "region": "full",                  # full | right | left
+    "local_math": True,                # AI reads, Python does the arithmetic
+    "prompt": "",
     "overlay_seconds": 6,
     "jpeg_quality": 70,
-    "max_width": 1280,                 # downscale before upload for speed (0 = off)
+    "max_width": 1280,
 }
 MODEL_DEFAULTS = {"gemini": "gemini-3.5-flash-lite", "openai": "gpt-4o-mini"}
 
-# Prompt for the non-local mode: the model reads AND solves, replies with digits.
 PLAIN_PROMPT = (
     "This is a Slap Battles 'bunker code' board with several task panels; each panel's "
     "answer is a SINGLE digit (0-9). IGNORE the game HUD/stats at the top and edges "
@@ -76,8 +62,7 @@ PLAIN_PROMPT = (
     "'4 3 6 2'. Never output a multi-digit number for a single task."
 )
 
-# Prompt used in local-math mode: the model only READS (its strong side); every
-# arithmetic line is then recomputed in Python (100% accurate — the model's weak side).
+# local-math mode: model just reads each task, Python recomputes the arithmetic
 STRUCT_PROMPT = (
     "This is a Slap Battles 'bunker code' board: several task panels, and each "
     "panel's answer is a SINGLE digit (0-9). IGNORE the game HUD and any stats at the "
@@ -87,9 +72,7 @@ STRUCT_PROMPT = (
     "parentheses), then ' ||| ', then its single-digit answer. Output nothing else."
 )
 
-# Known task pool for Slap Battles "bunker codes": the game shows a random subset of
-# these fixed tasks, so we don't solve — we recognise which task is on screen (fuzzy
-# match, tolerant of OCR slips) and return its known answer. Add new ones here.
+# known task pool -> answer, matched fuzzily against what's on screen
 TASKS = [
     ("4", "185,634-185,629+185,632-185,633"),
     ("2", "80+0-8+15-(85)"),
@@ -181,20 +164,18 @@ def parse_structured(raw):
         if "|||" not in line:
             continue
         left, right = line.split("|||", 1)
-        # 1) recognise a known task from the fixed pool (best: fixes OCR slips)
-        hit = match_task(left)
+        hit = match_task(left)                          # known task -> known answer
         if hit is not None:
             out.append(hit)
             continue
-        # 2) otherwise compute arithmetic locally
-        if _is_arith(left):
+        if _is_arith(left):                             # else compute it here
             try:
                 out.append(str(evaluate(left)))
                 continue
             except Exception:
                 pass
-        # 3) last resort: the model's own answer
-        m = re.search(r"-?\d+(?:\.\d+)?", right)
+        m = re.search(r"-?\d+(?:\.\d+)?", right)         # else trust the model
+
         out.append(m.group() if m else "?")
     return " ".join(out) if out else raw.strip()
 
@@ -211,13 +192,10 @@ def load_settings():
     return s
 
 
-# ---------------------------------------------------------------- overlay box
-# One persistent, borderless, top-most window. Same look as the word-game helper:
-# a dark card at the top-centre of the screen. We push updates through a queue so
-# the "Sent..." box turns into the answer box with no flicker and no stolen focus.
+# borderless top-most box, updated through a queue so it never steals focus
 BG = "#1a1a2e"
-SENT_COLOR = "#00ff88"     # the "highlight" used for what we sent
-ANSWER_COLOR = "#ffcc00"   # the answer, highlighted the same way (just a warmer hue)
+SENT_COLOR = "#00ff88"
+ANSWER_COLOR = "#ffcc00"
 ERROR_COLOR = "#ff6b6b"
 
 
@@ -278,12 +256,9 @@ class Overlay:
 overlay = Overlay()
 
 
-# ---------------------------------------------------------------- screenshot
-_MSS = getattr(mss, "MSS", None) or mss.mss     # new API, fall back to old alias
+_MSS = getattr(mss, "MSS", None) or mss.mss     # new/old mss API
 
-
-# NVIDIA NIM (and some others) reject an inline image whose base64 exceeds ~180 KB.
-# We cap the encoded size so any provider accepts the shot; text stays readable.
+# some providers (NIM) cap inline base64 around 180 KB, keep under it
 MAX_B64 = 175_000
 
 
@@ -306,7 +281,7 @@ def grab_jpeg(max_width, quality, max_b64=MAX_B64, region="full"):
         h = int(img.height * max_width / img.width)
         img = img.resize((max_width, h), Image.LANCZOS)
     jpeg = _encode(img, quality)
-    # shrink until the base64 fits the provider limit (base64 ≈ 4/3 of bytes)
+    # shrink until it fits the size cap
     while max_b64 and (len(jpeg) * 4) // 3 > max_b64 and img.width > 480:
         img = img.resize((int(img.width * 0.85), int(img.height * 0.85)),
                          Image.LANCZOS)
@@ -316,8 +291,7 @@ def grab_jpeg(max_width, quality, max_b64=MAX_B64, region="full"):
 
 # ---------------------------------------------------------------- LLM calls
 def _post_retry(url, *, json_body, headers=None, timeout=60, retries=3, label=""):
-    """POST that retries on timeouts, connection errors and transient server
-    errors (429/500/502/503/504) with a short backoff, instead of failing at once."""
+    """POST with a short backoff on timeouts and 429/5xx."""
     last = None
     for attempt in range(retries):
         try:
@@ -353,8 +327,7 @@ def ask_gemini(key, model, prompt, jpeg):
 
 
 def ask_openai(key, model, prompt, jpeg, base_url=""):
-    """Works with OpenAI and any OpenAI-compatible endpoint (NVIDIA NIM, Groq,
-    Mistral, OpenRouter) — just point base_url at their /v1."""
+    """OpenAI or any OpenAI-compatible endpoint (point base_url at their /v1)."""
     base = (base_url or "https://api.openai.com/v1").rstrip("/")
     b64 = base64.b64encode(jpeg).decode()
     body = {
