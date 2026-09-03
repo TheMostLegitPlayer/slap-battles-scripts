@@ -1,0 +1,26 @@
+# python cache / linux venv
+__pycache__/
+*.pyc
+.venv/
+
+# SECRETS + machine-specific — never commit the API key
+# (no leading path → matches in any directory, incl. app/config/)
+settings.json
+.deps_installed
+run.bat
+
+# debug junk / personal captures
+_shot_debug.jpg
+captures/
+screenshots/
+.trash/
+
+# backups / archives / build
+*.zip
+build/
+dist/
+*.spec
+archive/
+
+# ORB template experiment (unused by app)
+app/templates/
